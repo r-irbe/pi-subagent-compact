@@ -1,0 +1,24 @@
+{
+  "name": "@r-irbe/pi-subagent-compact",
+  "version": "0.1.0",
+  "description": "Pi extension: replace the built-in compaction summary with an in-process LLM call on the session's own model (or any configured model), with a customizable checkpoint format and a true passthrough fallback",
+  "main": "index.ts",
+  "type": "module",
+  "pi": {
+    "extension": "./index.ts"
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types selftest.mjs"
+  },
+  "keywords": [
+    "pi",
+    "pi-extension",
+    "compaction",
+    "context-window",
+    "summarizer",
+    "checkpoint",
+    "continuation-summary"
+  ],
+  "author": "r-irbe",
+  "license": "Apache-2.0"
+}

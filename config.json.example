@@ -1,0 +1,12 @@
+{
+  "mode": "subagent",
+  "model": null,
+  "systemPromptPath": null,
+  "checkpointHeader": "## Continuation Summary",
+  "headerNote": "This checkpoint was created during context compaction.",
+  "maxSummaryTokens": 8192,
+  "maxDigestChars": 120000,
+  "perMessageClipChars": 4000,
+  "notifyOnFallback": true,
+  "detailsMarker": "subagentCompact"
+}

@@ -115,6 +115,43 @@ previous-summary carry, and the header wrapper.
 - Any OpenAI-compatible endpoint (the `openai-completions` API), which
   covers llama.cpp, Ollama, vLLM, LiteLLM, and most gateways.
 
+## WAL checkpoint guard (operations)
+
+Independent of the compaction handler, this repository ships a maintenance
+script for the databases pi itself runs on. Several long-lived pi sessions
+share a handful of SQLite stores: the hermes locks coordinator, the session
+index, and the fetch cache. When one session runs a long indexing
+transaction, WAL checkpoints starve, the `-wal` file grows without bound,
+and every other session's writes start failing with `SQLITE_BUSY`
+("database is locked").
+
+`wal-guard.sh` truncating-checkpoints any of those WALs that grows past a
+threshold (default 1 MiB). It is data-safe by construction:
+`PRAGMA wal_checkpoint(TRUNCATE)` folds already-committed frames into the
+main database and never discards them; worst case it returns busy.
+
+Install with a cron line (every 10 minutes is plenty; the check is a stat):
+
+```sh
+(crontab -l 2>/dev/null; echo '*/10 * * * * '"$HOME"'/code/pi-subagent-compact/wal-guard.sh >/dev/null 2>&1') | crontab -
+```
+
+Verify it behaves before trusting it:
+
+```sh
+./wal-guard.sh --self-test   # sandbox database; no real store is touched
+```
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `WAL_GUARD_THRESHOLD` | `1048576` | Checkpoint a WAL once it reaches this many bytes. |
+| `WAL_GUARD_LOG` | `~/.pi/agent/wal-guard.log` | One line per checkpoint action. |
+| `WAL_GUARD_TIMEOUT` | `30` | Seconds before giving up on a busy checkpoint. |
+
+The monitored stores (built in): `~/.pi/agent/.pi-hermes-locks.sqlite`,
+`~/.pi/agent/pi-hermes-memory/sessions.db`, and
+`~/.pi/agent/magpi-cache/index.db`.
+
 ## License
 
 Apache-2.0

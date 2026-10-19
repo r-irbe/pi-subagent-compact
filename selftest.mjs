@@ -8,7 +8,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
     buildCheckpointPrompt,
+    buildDeterministicCheckpoint,
     buildTranscriptDigest,
+    clipMiddleOut,
+    extractStructuredMetadata,
     expandDeep,
     expandEnv,
     loadConfig,
@@ -104,4 +107,50 @@ check("model builder: shape, env placeholder, reject empty id", () => {
     assert.equal(modelFromConfig(null), null);
 });
 
-console.log(`self-test: ${passed}/7 checks passed`);
+check("middle-out truncation preserves both head context and tail errors", () => {
+    const text = "HEAD_START_" + "a".repeat(2000) + "_TAIL_ERROR: exit code 1";
+    const clipped = clipMiddleOut(text, 200);
+    assert(clipped.includes("HEAD_START_"));
+    assert(clipped.includes("[...truncated]"));
+    assert(clipped.includes("_TAIL_ERROR: exit code 1"));
+});
+
+check("structured metadata extracts filesTouched, toolCounts, commandsRun, and blockers across harnesses", () => {
+    const messages = [
+        {
+            role: "assistant",
+            content: [
+                { type: "toolCall", name: "edit", arguments: { path: "src/auth.ts" } },
+                { type: "tool_use", name: "run_command", input: { CommandLine: "rtk npm test" } },
+                { type: "tool", tool: "write_to_file", args: { TargetFile: "packages/pi-fleet/src/index.ts" } },
+            ],
+        },
+        {
+            role: "tool",
+            content: "Running tests...\nSyntaxError: Unexpected token in src/auth.ts\nFAIL: 1 failed",
+        },
+    ];
+    const meta = extractStructuredMetadata(messages);
+    assert(meta.filesTouched.includes("src/auth.ts"));
+    assert(meta.filesTouched.includes("packages/pi-fleet/src/index.ts"));
+    assert.equal(meta.toolCounts.edit, 1);
+    assert.equal(meta.toolCounts.run_command, 1);
+    assert.equal(meta.toolCounts.write_to_file, 1);
+    assert(meta.commandsRun.includes("rtk npm test"));
+    assert(meta.blockers.some((b) => b.includes("SyntaxError:")));
+});
+
+check("deterministic checkpoint builds prefix-cache-stable structured continuation summary", () => {
+    const messages = [
+        { role: "user", content: "Update src/mcp/registry.ts" },
+        { role: "assistant", content: [{ type: "toolCall", name: "edit", arguments: { path: "src/mcp/registry.ts" } }] },
+    ];
+    const ckpt = buildDeterministicCheckpoint("Prior phase complete", messages, { checkpointHeader: "## Continuation Summary" });
+    assert(ckpt.startsWith("## Continuation Summary"));
+    assert(ckpt.includes("### Prior Checkpoint"));
+    assert(ckpt.includes("### Structured Activity Index"));
+    assert(ckpt.includes("src/mcp/registry.ts"));
+    assert(ckpt.includes("edit:1"));
+});
+
+console.log(`self-test: ${passed}/10 checks passed`);

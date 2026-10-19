@@ -1,26 +1,18 @@
 /**
  * pi-subagent-compact: a pi extension that takes over compaction summaries.
  *
- * Registers a session_before_compact handler. When active (mode "subagent")
- * it summarizes the messages being discarded with a one-shot LLM call --
- * the session's own model by default, or any configured model -- and
- * returns the summary in a checkpoint format you control. When anything
- * fails it returns undefined, so any other compaction handler (for example
- * a memory daemon's) keeps authority: a true fallback, never a broken
- * compaction.
+ * Registers a session_before_compact handler. When active (mode "subagent"
+ * or "deterministic") it summarizes the messages being discarded with either:
+ *   - "subagent": a one-shot LLM call (with optional deterministicFallback)
+ *   - "deterministic": a zero-token, prefix-cache-stable structured digest
+ * and returns the summary in a checkpoint format you control. When anything
+ * fails and deterministicFallback is disabled, it returns undefined so any
+ * other compaction handler keeps authority.
  *
- * Handler-order contract: pi's extension runner executes every handler and
- * keeps the LAST non-null result. Extensions load in alphabetical
- * directory order, so to override another extension's summary this
- * extension's directory must sort AFTER that extension's (e.g. install as
- * ~/.pi/agent/extensions/zz-subagent-compact to beat nearly everything).
- * Handlers registered before this one still run; their side effects
- * (memory-store flushes, checkpoints) are preserved.
- *
- * Configuration lives in config.json next to this file (see
- * config.json.example). Every string value of the form "${VAR}" is
- * expanded from the environment at load time, so API keys can come from
- * the environment instead of the config file.
+ * Includes middle-out truncation (preserving both head context and tail
+ * compiler/test errors) and structured metadata extraction (filesTouched,
+ * toolCounts, commandsRun, blockers) across Pi, Antigravity, and OpenCode
+ * message shapes.
  *
  * ASCII-only invariant.
  */
@@ -64,6 +56,7 @@ export function loadConfig(configPath) {
         maxDigestChars: 120000,
         perMessageClipChars: 4000,
         notifyOnFallback: true,
+        deterministicFallback: false,
         detailsMarker: "subagentCompact",
     };
     let raw = {};
@@ -75,7 +68,7 @@ export function loadConfig(configPath) {
     const cfg = { ...defaults, ...expandDeep(raw), _loaded: true };
     // Legacy alias from the remnic-private prototype.
     if (!raw.mode && raw.compactionSummarizer) cfg.mode = raw.compactionSummarizer;
-    if (cfg.mode !== "subagent") cfg.mode = "daemon";
+    if (cfg.mode !== "subagent" && cfg.mode !== "deterministic") cfg.mode = "daemon";
     return cfg;
 }
 
@@ -94,6 +87,36 @@ function loadSystemPrompt(cfg) {
     }
 }
 
+/**
+ * Middle-out truncation: preserves the first 60% (head) and last 40% (tail)
+ * of a long message or tool output so trailing compiler errors, stack traces,
+ * and exit codes are retained alongside the opening context.
+ */
+export function clipMiddleOut(text, maxChars) {
+    if (!maxChars || maxChars <= 0 || text.length <= maxChars) return text;
+    const headLen = Math.max(1, Math.floor(maxChars * 0.6));
+    const tailLen = Math.max(0, maxChars - headLen);
+    if (tailLen === 0) return `${text.slice(0, headLen)}\n[...truncated]`;
+    return `${text.slice(0, headLen)}\n[...truncated]\n${text.slice(text.length - tailLen)}`;
+}
+
+function formatToolPart(part) {
+    const name = part.name || part.tool || "unknown";
+    const args = part.arguments || part.args || part.input || {};
+    if (args && typeof args === "object") {
+        const target = args.path || args.TargetFile || args.AbsolutePath || args.filePath || args.DirectoryPath;
+        const cmd = args.command || args.CommandLine;
+        if (typeof target === "string" && target) {
+            return `[tool: ${name} path=${target}]`;
+        }
+        if (typeof cmd === "string" && cmd) {
+            const shortCmd = cmd.length > 80 ? `${cmd.slice(0, 77)}...` : cmd;
+            return `[tool: ${name} cmd="${shortCmd}"]`;
+        }
+    }
+    return `[tool: ${name}]`;
+}
+
 function messageText(message) {
     const content = message && message.content;
     if (typeof content === "string") return content;
@@ -102,7 +125,9 @@ function messageText(message) {
             .map((part) => {
                 if (typeof part === "string") return part;
                 if (part && typeof part.text === "string") return part.text;
-                if (part && part.type === "toolCall") return `[tool: ${part.name || "unknown"}]`;
+                if (part && (part.type === "toolCall" || part.type === "tool_use" || part.type === "tool")) {
+                    return formatToolPart(part);
+                }
                 if (part && part.type) return `[${part.type}]`;
                 return "";
             })
@@ -111,6 +136,59 @@ function messageText(message) {
     }
     if (message && typeof message.text === "string") return message.text;
     return "";
+}
+
+/**
+ * Extract deterministic structured metadata across Pi, Antigravity, and OpenCode
+ * message arrays: touched files, tool call histogram, recent commands, and blockers.
+ */
+export function extractStructuredMetadata(messages) {
+    const filesSet = new Set();
+    const toolCounts = {};
+    const commandsRun = [];
+    const blockersSet = new Set();
+    const pathRe = /(?:^|[\s"'`(])((?:\/[A-Za-z0-9._-]+){2,}|(?:src|test|packages|lib|docs|ggml|examples)\/[A-Za-z0-9._/-]+\.[A-Za-z0-9]+)/g;
+    const errRe = /(?:^|\n)\s*((?:Error|SyntaxError|TypeError|AssertionError|FAIL|fatal):[^\n]{1,160}|✖[^\n]{1,160})/g;
+
+    for (const msg of messages || []) {
+        if (!msg || typeof msg !== "object") continue;
+        const content = Array.isArray(msg.content) ? msg.content : [];
+        for (const part of content) {
+            if (!part || typeof part !== "object") continue;
+            if (part.type === "toolCall" || part.type === "tool_use" || part.type === "tool") {
+                const name = String(part.name || part.tool || "unknown");
+                toolCounts[name] = (toolCounts[name] || 0) + 1;
+                const args = part.arguments || part.args || part.input || {};
+                if (args && typeof args === "object") {
+                    for (const k of ["path", "TargetFile", "AbsolutePath", "filePath", "DirectoryPath", "SearchPath"]) {
+                        if (typeof args[k] === "string" && args[k].trim()) filesSet.add(args[k].trim());
+                    }
+                    const cmd = args.command || args.CommandLine;
+                    if (typeof cmd === "string" && cmd.trim()) {
+                        commandsRun.push(cmd.trim().slice(0, 120));
+                    }
+                }
+            }
+        }
+        const txt = messageText(msg);
+        if (txt) {
+            let m;
+            while ((m = pathRe.exec(txt)) !== null) {
+                filesSet.add(m[1]);
+            }
+            while ((m = errRe.exec(txt)) !== null) {
+                const clean = m[1].replace(/[^\x20-\x7E]/g, "").trim();
+                if (clean) blockersSet.add(clean);
+            }
+        }
+    }
+
+    return {
+        filesTouched: [...filesSet].sort().slice(0, 40),
+        toolCounts,
+        commandsRun: commandsRun.slice(-15),
+        blockers: [...blockersSet].slice(0, 15),
+    };
 }
 
 /** Flatten the messages to summarize into a bounded plain-text digest. */
@@ -122,7 +200,7 @@ export function buildTranscriptDigest(messages, maxChars, perMessageClipChars) {
         const text = messageText(message).trim();
         if (!text) continue;
         const clip = perMessageClipChars > 0 ? perMessageClipChars : text.length;
-        const clipped = text.length > clip ? `${text.slice(0, clip)}\n[...truncated]` : text;
+        const clipped = clipMiddleOut(text, clip);
         const block = `### ${role}\n${clipped}`;
         if (maxChars > 0 && total + block.length > maxChars) {
             parts.push("[digest truncated: older messages omitted]");
@@ -134,17 +212,77 @@ export function buildTranscriptDigest(messages, maxChars, perMessageClipChars) {
     return parts.join("\n\n");
 }
 
-/** Assemble the user prompt: previous summary + the digest. */
-export function buildCheckpointPrompt(previousSummary, digest) {
-    return [
+/** Assemble the user prompt: previous summary + structured metadata + the digest. */
+export function buildCheckpointPrompt(previousSummary, digest, metadata = null) {
+    const lines = [
         "Produce the continuation checkpoint now.",
         "",
         "## Previous Summary",
         previousSummary && previousSummary.trim() ? previousSummary : "none",
+    ];
+    if (metadata && typeof metadata === "object") {
+        lines.push("", "## Structured Activity Index");
+        if (Array.isArray(metadata.filesTouched) && metadata.filesTouched.length > 0) {
+            lines.push(`- Files Touched: ${metadata.filesTouched.join(", ")}`);
+        }
+        if (metadata.toolCounts && Object.keys(metadata.toolCounts).length > 0) {
+            const tools = Object.entries(metadata.toolCounts)
+                .sort(([a], [b]) => a.localeCompare(b))
+                .map(([k, v]) => `${k}(${v})`)
+                .join(", ");
+            lines.push(`- Tool Calls: ${tools}`);
+        }
+        if (Array.isArray(metadata.commandsRun) && metadata.commandsRun.length > 0) {
+            lines.push(`- Recent Commands: ${metadata.commandsRun.slice(-5).join(" ; ")}`);
+        }
+        if (Array.isArray(metadata.blockers) && metadata.blockers.length > 0) {
+            lines.push(`- Detected Errors/Blockers: ${metadata.blockers.join(" | ")}`);
+        }
+    }
+    lines.push(
         "",
         "## Transcript digest (to summarize into 'Conversation Excerpt')",
         digest,
-    ].join("\n");
+    );
+    return lines.join("\n");
+}
+
+/**
+ * Build a zero-token, deterministic, prefix-cache-stable continuation checkpoint
+ * when running in "deterministic" mode or when the LLM summarizer falls back.
+ */
+export function buildDeterministicCheckpoint(previousSummary, messages, cfg = {}) {
+    const meta = extractStructuredMetadata(messages || []);
+    const digest = buildTranscriptDigest(
+        (messages || []).slice(-12),
+        Math.min(cfg.maxDigestChars || 24000, 24000),
+        Math.min(cfg.perMessageClipChars || 1200, 1200),
+    );
+    const sections = [];
+    if (previousSummary && previousSummary.trim()) {
+        sections.push("### Prior Checkpoint\n" + previousSummary.trim());
+    }
+    const indexLines = ["### Structured Activity Index"];
+    indexLines.push(`- Files Touched (${meta.filesTouched.length}): ${meta.filesTouched.length ? meta.filesTouched.join(", ") : "none"}`);
+    const tools = Object.entries(meta.toolCounts)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([k, v]) => `${k}:${v}`)
+        .join(", ");
+    indexLines.push(`- Tool Calls: ${tools || "none"}`);
+    if (meta.commandsRun.length > 0) {
+        indexLines.push(`- Recent Commands: ${meta.commandsRun.slice(-5).join(" ; ")}`);
+    }
+    if (meta.blockers.length > 0) {
+        indexLines.push(`- Active Blockers/Errors: ${meta.blockers.join(" | ")}`);
+    }
+    sections.push(indexLines.join("\n"));
+    if (digest) {
+        sections.push("### Recent Conversation Excerpt\n" + digest);
+    }
+    return withCheckpointHeader(sections.join("\n\n"), {
+        checkpointHeader: cfg.checkpointHeader ?? DEFAULT_HEADER,
+        headerNote: cfg.headerNote ?? DEFAULT_HEADER_NOTE,
+    });
 }
 
 /** Wrap (or not) the raw summary in the configured checkpoint header. */
@@ -158,45 +296,40 @@ export function withCheckpointHeader(text, cfg) {
 
 /** Resolve the completion function: bare specifier first, then a global install. */
 async function loadCompleteSimple() {
-    try {
-        const mod = await import("@earendil-works/pi-ai/compat");
-        return mod.completeSimple;
-    } catch {
-        // fall through to the well-known global location
+    const candidates = ["@mariozechner/pi-ai"];
+    if (process.env.PI_AI_MODULE_PATH) candidates.unshift(process.env.PI_AI_MODULE_PATH);
+    let lastErr;
+    for (const spec of candidates) {
+        try {
+            const mod = await import(spec);
+            if (typeof mod.completeSimple === "function") return mod.completeSimple;
+        } catch (err) {
+            lastErr = err;
+        }
     }
-    const global = join(
-        process.env.HOME || "",
-        ".local/lib/node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai/dist/compat.js",
-    );
-    if (existsSync(global)) {
-        const mod = await import(`file://${global}`);
-        return mod.completeSimple;
-    }
-    throw new Error(
-        "pi-subagent-compact: cannot import @earendil-works/pi-ai/compat (is pi installed?)",
-    );
+    throw new Error(`cannot resolve @mariozechner/pi-ai: ${lastErr?.message || "not found"}`);
 }
 
-/**
- * Run the summary completion. `model` is the model object (the session's
- * own, or one built from config). Resolves to the summary text; rejects on
- * transport errors; resolves with an empty string when the model returns
- * an error result (checked via stopReason so callers can fall back).
- */
-export async function summarizeWithModel(model, systemPrompt, prompt, signal, maxTokens, apiKey) {
+async function summarizeWithModel(model, systemPrompt, userPrompt, signal, maxTokens, apiKey) {
     const completeSimple = await loadCompleteSimple();
-    const result = await completeSimple(
+    const response = await completeSimple(
         model,
-        [
-            { role: "system", content: systemPrompt },
-            { role: "user", content: prompt },
-        ],
-        { signal, maxTokens, ...(apiKey ? { apiKey } : {}) },
+        {
+            systemPrompt,
+            messages: [
+                {
+                    role: "user",
+                    content: [{ type: "text", text: userPrompt }],
+                    timestamp: Date.now(),
+                },
+            ],
+        },
+        { maxTokens, signal, apiKey },
     );
-    if (result && result.stopReason === "error") {
-        throw new Error(`summarizer model error: ${result.errorMessage || "unknown"}`);
+    if (response && response.stopReason === "error") {
+        throw new Error(response.errorMessage || "summarizer returned error");
     }
-    const content = result && Array.isArray(result.content) ? result.content : [];
+    const content = (response && response.content) || [];
     const text = content
         .map((part) => (part && typeof part.text === "string" ? part.text : ""))
         .join("");
@@ -231,33 +364,56 @@ export default function createSubagentCompactExtension(pi) {
         ? resolve(process.env.PI_SUBAGENT_COMPACT_CONFIG)
         : join(HERE, "config.json");
     const cfg = loadConfig(configPath);
-    if (cfg.mode !== "subagent") return;
+    if (cfg.mode !== "subagent" && cfg.mode !== "deterministic") return;
 
-    let systemPrompt;
-    try {
-        systemPrompt = loadSystemPrompt(cfg);
-    } catch (err) {
-        // A broken prompt must not break session startup: stay inert and
-        // let other compaction handlers work.
+    let systemPrompt = "";
+    if (cfg.mode === "subagent") {
         try {
-            console.error(String(err.message || err));
-        } catch {}
-        return;
+            systemPrompt = loadSystemPrompt(cfg);
+        } catch (err) {
+            try {
+                console.error(String(err.message || err));
+            } catch {}
+            if (!cfg.deterministicFallback) return;
+        }
     }
 
     const configuredModel = modelFromConfig(cfg.model);
 
     pi.on("session_before_compact", async (event, ctx) => {
+        const prep = event.preparation || {};
+        const messages = prep.messagesToSummarize || [];
+        const meta = extractStructuredMetadata(messages);
         try {
+            if (cfg.mode === "deterministic") {
+                const summary = buildDeterministicCheckpoint(prep.previousSummary, messages, cfg);
+                return {
+                    compaction: {
+                        summary,
+                        firstKeptEntryId: prep.firstKeptEntryId,
+                        tokensBefore: prep.tokensBefore,
+                        details: cfg.detailsMarker
+                            ? {
+                                  [cfg.detailsMarker]: {
+                                      version: 2,
+                                      source: "deterministic",
+                                      filesTouched: meta.filesTouched,
+                                      toolCounts: meta.toolCounts,
+                                      blockersCount: meta.blockers.length,
+                                  },
+                              }
+                            : undefined,
+                    },
+                };
+            }
             const model = configuredModel || ctx.model;
             if (!model) return undefined;
-            const prep = event.preparation || {};
             const digest = buildTranscriptDigest(
-                prep.messagesToSummarize || [],
+                messages,
                 cfg.maxDigestChars,
                 cfg.perMessageClipChars,
             );
-            const prompt = buildCheckpointPrompt(prep.previousSummary, digest);
+            const prompt = buildCheckpointPrompt(prep.previousSummary, digest, meta);
             const raw = await summarizeWithModel(
                 model,
                 systemPrompt,
@@ -274,11 +430,40 @@ export default function createSubagentCompactExtension(pi) {
                     firstKeptEntryId: prep.firstKeptEntryId,
                     tokensBefore: prep.tokensBefore,
                     details: cfg.detailsMarker
-                        ? { [cfg.detailsMarker]: { version: 1, source: "subagent" } }
+                        ? {
+                              [cfg.detailsMarker]: {
+                                  version: 2,
+                                  source: "subagent",
+                                  filesTouched: meta.filesTouched,
+                                  toolCounts: meta.toolCounts,
+                                  blockersCount: meta.blockers.length,
+                              },
+                          }
                         : undefined,
                 },
             };
         } catch (err) {
+            if (cfg.deterministicFallback) {
+                const summary = buildDeterministicCheckpoint(prep.previousSummary, messages, cfg);
+                return {
+                    compaction: {
+                        summary,
+                        firstKeptEntryId: prep.firstKeptEntryId,
+                        tokensBefore: prep.tokensBefore,
+                        details: cfg.detailsMarker
+                            ? {
+                                  [cfg.detailsMarker]: {
+                                      version: 2,
+                                      source: "deterministic-fallback",
+                                      filesTouched: meta.filesTouched,
+                                      toolCounts: meta.toolCounts,
+                                      blockersCount: meta.blockers.length,
+                                  },
+                              }
+                            : undefined,
+                    },
+                };
+            }
             if (cfg.notifyOnFallback && ctx && typeof ctx.notify === "function") {
                 try {
                     ctx.notify(`pi-subagent-compact: falling back (${err.message})`, "warning");

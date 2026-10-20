@@ -7,7 +7,7 @@ import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import {
+import createSubagentCompactExtension, {
     buildCheckpointPrompt,
     buildDeterministicCheckpoint,
     buildTranscriptDigest,
@@ -168,6 +168,114 @@ check("deterministic checkpoint builds prefix-cache-stable structured continuati
     assert(ckpt.includes("edit:1"));
 });
 
+const asyncChecks = [];
+function checkAsync(name, fn) {
+    asyncChecks.push({ name, fn });
+}
+
+checkAsync("end-to-end simulated live session compaction hook lifecycle and fallback", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "psc-e2e-"));
+    const mockPiAiPath = join(dir, "mock-pi-ai.mjs");
+    writeFileSync(
+        mockPiAiPath,
+        [
+            "export let shouldFail = false;",
+            "export let lastCall = null;",
+            "export function setShouldFail(v) { shouldFail = v; }",
+            "export async function completeSimple(model, payload, opts) {",
+            "    lastCall = { model, payload, opts };",
+            "    if (shouldFail) {",
+            "        return { stopReason: 'error', errorMessage: 'mock gateway timeout' };",
+            "    }",
+            "    return {",
+            "        stopReason: 'stop',",
+            "        content: [{ type: 'text', text: '### Goal\\nFix src/auth.ts login flow\\n\\n### Next Steps\\nRun test suite' }],",
+            "    };",
+            "}",
+        ].join("\n"),
+    );
+
+    const cfgPath = join(dir, "config.json");
+    writeFileSync(
+        cfgPath,
+        JSON.stringify({
+            mode: "subagent",
+            checkpointHeader: "## Continuation Summary",
+            headerNote: "Checkpoint created during live session compaction.",
+            notifyOnFallback: true,
+            deterministicFallback: false,
+            detailsMarker: "remnicSubagentCompact",
+        }),
+    );
+
+    const prevCfg = process.env.PI_SUBAGENT_COMPACT_CONFIG;
+    const prevMod = process.env.PI_AI_MODULE_PATH;
+    process.env.PI_SUBAGENT_COMPACT_CONFIG = cfgPath;
+    process.env.PI_AI_MODULE_PATH = mockPiAiPath;
+
+    try {
+        const handlers = {};
+        const mockPi = {
+            on(eventName, handler) {
+                handlers[eventName] = handler;
+            },
+        };
+        createSubagentCompactExtension(mockPi);
+        assert.equal(typeof handlers.session_before_compact, "function");
+
+        const sessionEvent = {
+            preparation: {
+                previousSummary: "Initial phase complete.",
+                firstKeptEntryId: "entry-42",
+                tokensBefore: 64000,
+                messagesToSummarize: [
+                    { role: "user", content: "Fix the login bug in src/auth.ts" },
+                    {
+                        role: "assistant",
+                        content: [
+                            { type: "text", text: "Updating src/auth.ts" },
+                            { type: "toolCall", name: "edit", arguments: { path: "src/auth.ts" } },
+                        ],
+                    },
+                ],
+            },
+            signal: new AbortController().signal,
+        };
+        const notifications = [];
+        const mockCtx = {
+            model: { provider: "mock", id: "mock-summarizer" },
+            notify(msg, level) {
+                notifications.push({ msg, level });
+            },
+        };
+
+        const res = await handlers.session_before_compact(sessionEvent, mockCtx);
+        assert(res && res.compaction, "expected compaction result");
+        assert(res.compaction.summary.startsWith("## Continuation Summary"));
+        assert(res.compaction.summary.includes("Fix src/auth.ts login flow"));
+        assert.equal(res.compaction.firstKeptEntryId, "entry-42");
+        assert.equal(res.compaction.tokensBefore, 64000);
+        assert(res.compaction.details && res.compaction.details.remnicSubagentCompact);
+        assert.equal(res.compaction.details.remnicSubagentCompact.source, "subagent");
+        assert(res.compaction.details.remnicSubagentCompact.filesTouched.includes("src/auth.ts"));
+        assert.equal(res.compaction.details.remnicSubagentCompact.toolCounts.edit, 1);
+
+        // Verify fallback behavior when notifyOnFallback is enabled
+        const mockMod = await import(mockPiAiPath);
+        mockMod.setShouldFail(true);
+        const fallbackRes = await handlers.session_before_compact(sessionEvent, mockCtx);
+        assert.equal(fallbackRes, undefined);
+        assert.equal(notifications.length, 1);
+        assert.equal(notifications[0].level, "warning");
+        assert(notifications[0].msg.includes("falling back (mock gateway timeout)"));
+    } finally {
+        if (prevCfg === undefined) delete process.env.PI_SUBAGENT_COMPACT_CONFIG;
+        else process.env.PI_SUBAGENT_COMPACT_CONFIG = prevCfg;
+        if (prevMod === undefined) delete process.env.PI_AI_MODULE_PATH;
+        else process.env.PI_AI_MODULE_PATH = prevMod;
+    }
+});
+
 check("source files strictly adhere to 7-bit ASCII invariant", () => {
     for (const fname of ["index.ts", "selftest.mjs"]) {
         const src = readFileSync(join(__dirname, fname), "utf-8");
@@ -175,4 +283,9 @@ check("source files strictly adhere to 7-bit ASCII invariant", () => {
     }
 });
 
-console.log(`self-test: ${passed}/11 checks passed`);
+for (const { name, fn } of asyncChecks) {
+    await fn();
+    passed += 1;
+}
+
+console.log(`self-test: ${passed}/12 checks passed`);

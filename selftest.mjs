@@ -3,9 +3,10 @@
 // Note: key fields are built via computed properties so that secret
 // scanners do not mistake env-var placeholder tests for credentials.
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
     buildCheckpointPrompt,
     buildDeterministicCheckpoint,
@@ -18,6 +19,8 @@ import {
     modelFromConfig,
     withCheckpointHeader,
 } from "./index.ts";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
 let passed = 0;
 function check(name, fn) {
@@ -126,18 +129,30 @@ check("structured metadata extracts filesTouched, toolCounts, commandsRun, and b
             ],
         },
         {
+            role: "assistant",
+            tool_calls: [
+                { name: "run_command", arguments: JSON.stringify({ command: "rtk npm test", file_path: "src/mcp/client.ts" }) },
+            ],
+            tool_call: {
+                name: "run_command",
+                arguments: JSON.stringify({ cmd: "rtk npm test" }),
+            },
+        },
+        {
             role: "tool",
-            content: "Running tests...\nSyntaxError: Unexpected token in src/auth.ts\nFAIL: 1 failed",
+            content: "Running tests...\nSyntaxError: Unexpected token in src/auth.ts\nFAIL: 1 failed\n\u2716 test suite failed",
         },
     ];
     const meta = extractStructuredMetadata(messages);
     assert(meta.filesTouched.includes("src/auth.ts"));
     assert(meta.filesTouched.includes("packages/pi-fleet/src/index.ts"));
+    assert(meta.filesTouched.includes("src/mcp/client.ts"));
     assert.equal(meta.toolCounts.edit, 1);
-    assert.equal(meta.toolCounts.run_command, 1);
+    assert.equal(meta.toolCounts.run_command, 3);
     assert.equal(meta.toolCounts.write_to_file, 1);
-    assert(meta.commandsRun.includes("rtk npm test"));
+    assert(meta.commandsRun.includes("rtk npm test (x3)"));
     assert(meta.blockers.some((b) => b.includes("SyntaxError:")));
+    assert(meta.blockers.some((b) => b.includes("test suite failed")));
 });
 
 check("deterministic checkpoint builds prefix-cache-stable structured continuation summary", () => {
@@ -153,4 +168,11 @@ check("deterministic checkpoint builds prefix-cache-stable structured continuati
     assert(ckpt.includes("edit:1"));
 });
 
-console.log(`self-test: ${passed}/10 checks passed`);
+check("source files strictly adhere to 7-bit ASCII invariant", () => {
+    for (const fname of ["index.ts", "selftest.mjs"]) {
+        const src = readFileSync(join(__dirname, fname), "utf-8");
+        assert.equal(/[\u0080-\uFFFF]/.test(src), false, `${fname} contains non-ASCII characters`);
+    }
+});
+
+console.log(`self-test: ${passed}/11 checks passed`);

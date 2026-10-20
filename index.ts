@@ -100,12 +100,56 @@ export function clipMiddleOut(text, maxChars) {
     return `${text.slice(0, headLen)}\n[...truncated]\n${text.slice(text.length - tailLen)}`;
 }
 
+function parseToolArgs(part) {
+    if (!part || typeof part !== "object") return {};
+    const fnObj = part.function && typeof part.function === "object" ? part.function : null;
+    const raw = part.arguments ?? part.args ?? part.input ?? (fnObj ? fnObj.arguments : undefined);
+    if (typeof raw === "string") {
+        try {
+            const parsed = JSON.parse(raw);
+            if (parsed && typeof parsed === "object") return parsed;
+        } catch {
+            return {};
+        }
+        return {};
+    }
+    if (raw && typeof raw === "object") return raw;
+    return {};
+}
+
+function getToolName(part) {
+    if (!part || typeof part !== "object") return "unknown";
+    const fnObj = part.function && typeof part.function === "object" ? part.function : null;
+    return String(part.name || part.tool || (fnObj && fnObj.name) || "unknown");
+}
+
+function collectMessageToolParts(msg) {
+    if (!msg || typeof msg !== "object") return [];
+    const parts = [];
+    if (Array.isArray(msg.content)) {
+        for (const part of msg.content) {
+            if (part && typeof part === "object" && (part.type === "toolCall" || part.type === "tool_use" || part.type === "tool")) {
+                parts.push(part);
+            }
+        }
+    }
+    if (Array.isArray(msg.tool_calls)) {
+        for (const tc of msg.tool_calls) {
+            if (tc && typeof tc === "object") parts.push(tc);
+        }
+    }
+    if (msg.tool_call && typeof msg.tool_call === "object") {
+        parts.push(msg.tool_call);
+    }
+    return parts;
+}
+
 function formatToolPart(part) {
-    const name = part.name || part.tool || "unknown";
-    const args = part.arguments || part.args || part.input || {};
+    const name = getToolName(part);
+    const args = parseToolArgs(part);
     if (args && typeof args === "object") {
-        const target = args.path || args.TargetFile || args.AbsolutePath || args.filePath || args.DirectoryPath;
-        const cmd = args.command || args.CommandLine;
+        const target = args.path || args.TargetFile || args.AbsolutePath || args.filePath || args.file_path || args.DirectoryPath;
+        const cmd = args.command || args.CommandLine || args.cmd;
         if (typeof target === "string" && target) {
             return `[tool: ${name} path=${target}]`;
         }
@@ -118,24 +162,35 @@ function formatToolPart(part) {
 }
 
 function messageText(message) {
-    const content = message && message.content;
-    if (typeof content === "string") return content;
-    if (Array.isArray(content)) {
-        return content
-            .map((part) => {
-                if (typeof part === "string") return part;
-                if (part && typeof part.text === "string") return part.text;
-                if (part && (part.type === "toolCall" || part.type === "tool_use" || part.type === "tool")) {
-                    return formatToolPart(part);
-                }
-                if (part && part.type) return `[${part.type}]`;
-                return "";
-            })
-            .filter(Boolean)
-            .join("\n");
+    if (!message || typeof message !== "object") return "";
+    const segments = [];
+    const content = message.content;
+    if (typeof content === "string") {
+        if (content) segments.push(content);
+    } else if (Array.isArray(content)) {
+        for (const part of content) {
+            if (typeof part === "string") {
+                if (part) segments.push(part);
+            } else if (part && typeof part.text === "string") {
+                if (part.text) segments.push(part.text);
+            } else if (part && (part.type === "toolCall" || part.type === "tool_use" || part.type === "tool")) {
+                segments.push(formatToolPart(part));
+            } else if (part && part.type) {
+                segments.push(`[${part.type}]`);
+            }
+        }
+    } else if (typeof message.text === "string" && message.text) {
+        segments.push(message.text);
     }
-    if (message && typeof message.text === "string") return message.text;
-    return "";
+    if (Array.isArray(message.tool_calls)) {
+        for (const tc of message.tool_calls) {
+            if (tc && typeof tc === "object") segments.push(formatToolPart(tc));
+        }
+    }
+    if (message.tool_call && typeof message.tool_call === "object") {
+        segments.push(formatToolPart(message.tool_call));
+    }
+    return segments.filter(Boolean).join("\n");
 }
 
 /**
@@ -145,28 +200,25 @@ function messageText(message) {
 export function extractStructuredMetadata(messages) {
     const filesSet = new Set();
     const toolCounts = {};
-    const commandsRun = [];
+    const rawCommands = [];
     const blockersSet = new Set();
     const pathRe = /(?:^|[\s"'`(])((?:\/[A-Za-z0-9._-]+){2,}|(?:src|test|packages|lib|docs|ggml|examples)\/[A-Za-z0-9._/-]+\.[A-Za-z0-9]+)/g;
-    const errRe = /(?:^|\n)\s*((?:Error|SyntaxError|TypeError|AssertionError|FAIL|fatal):[^\n]{1,160}|✖[^\n]{1,160})/g;
+    const errRe = /(?:^|\n)\s*((?:Error|SyntaxError|TypeError|AssertionError|FAIL|fatal):[^\n]{1,160}|\u2716[^\n]{1,160})/g;
 
     for (const msg of messages || []) {
         if (!msg || typeof msg !== "object") continue;
-        const content = Array.isArray(msg.content) ? msg.content : [];
-        for (const part of content) {
-            if (!part || typeof part !== "object") continue;
-            if (part.type === "toolCall" || part.type === "tool_use" || part.type === "tool") {
-                const name = String(part.name || part.tool || "unknown");
-                toolCounts[name] = (toolCounts[name] || 0) + 1;
-                const args = part.arguments || part.args || part.input || {};
-                if (args && typeof args === "object") {
-                    for (const k of ["path", "TargetFile", "AbsolutePath", "filePath", "DirectoryPath", "SearchPath"]) {
-                        if (typeof args[k] === "string" && args[k].trim()) filesSet.add(args[k].trim());
-                    }
-                    const cmd = args.command || args.CommandLine;
-                    if (typeof cmd === "string" && cmd.trim()) {
-                        commandsRun.push(cmd.trim().slice(0, 120));
-                    }
+        const toolParts = collectMessageToolParts(msg);
+        for (const part of toolParts) {
+            const name = getToolName(part);
+            toolCounts[name] = (toolCounts[name] || 0) + 1;
+            const args = parseToolArgs(part);
+            if (args && typeof args === "object") {
+                for (const k of ["path", "TargetFile", "AbsolutePath", "filePath", "file_path", "DirectoryPath", "SearchPath"]) {
+                    if (typeof args[k] === "string" && args[k].trim()) filesSet.add(args[k].trim());
+                }
+                const cmd = args.command || args.CommandLine || args.cmd;
+                if (typeof cmd === "string" && cmd.trim()) {
+                    rawCommands.push(cmd.trim().slice(0, 120));
                 }
             }
         }
@@ -183,10 +235,23 @@ export function extractStructuredMetadata(messages) {
         }
     }
 
+    const collapsedCommands = [];
+    for (const cmd of rawCommands) {
+        const prev = collapsedCommands[collapsedCommands.length - 1];
+        if (prev && prev.cmd === cmd) {
+            prev.count += 1;
+        } else {
+            collapsedCommands.push({ cmd, count: 1 });
+        }
+    }
+    const commandsRun = collapsedCommands
+        .map((entry) => (entry.count > 1 ? `${entry.cmd} (x${entry.count})` : entry.cmd))
+        .slice(-15);
+
     return {
         filesTouched: [...filesSet].sort().slice(0, 40),
         toolCounts,
-        commandsRun: commandsRun.slice(-15),
+        commandsRun,
         blockers: [...blockersSet].slice(0, 15),
     };
 }

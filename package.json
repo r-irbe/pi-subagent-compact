@@ -20,5 +20,8 @@
     "continuation-summary"
   ],
   "author": "r-irbe",
-  "license": "Apache-2.0"
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=22.6.0"
+  }
 }
